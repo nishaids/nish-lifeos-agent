@@ -347,6 +347,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle errors in the bot."""
+    # Handle Conflict errors gracefully (e.g., stale deployment still polling)
+    if "Conflict" in str(context.error):
+        logger.warning("Another bot instance conflict detected - will auto-resolve in seconds")
+        return
+
     logger.error(f"Bot error: {context.error}")
 
     if update and update.message:
@@ -379,7 +384,7 @@ def create_bot_application() -> Application:
         )
 
     # Build the application
-    app = Application.builder().token(token).build()
+    app = Application.builder().token(token).connect_timeout(30).read_timeout(30).build()
 
     # Register command handlers
     app.add_handler(CommandHandler("start", start_command))
@@ -423,11 +428,20 @@ def run_bot() -> None:
 
         app.post_init = post_init
 
+        # Forcefully clear any existing webhook/polling connections (e.g., stale Railway deployment)
+        logger.info("Clearing any existing webhook connections...")
+        async def clear_webhook():
+            await app.bot.delete_webhook(drop_pending_updates=True)
+        asyncio.get_event_loop().run_until_complete(clear_webhook())
+        logger.info("Webhook cleared successfully")
+
         logger.info("Starting LifeOS Telegram bot with polling...")
         print("🧠 LifeOS Agent bot is running! Press Ctrl+C to stop.")
         app.run_polling(
             drop_pending_updates=True,
             allowed_updates=Update.ALL_TYPES,
+            timeout=10,
+            pool_timeout=10,
         )
 
     except Exception as e:
