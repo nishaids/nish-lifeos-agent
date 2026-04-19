@@ -1,9 +1,18 @@
 """
-LifeOS Agent - LangGraph Orchestration Flow
-==============================================
-State machine orchestrator that connects all 6 CrewAI agents
-in sequence: Memory → Research → Goals → Strategy → Planning → Report → PDF.
-Uses TypedDict state and automatic retry with fallback.
+LifeOS Agent - LangGraph Orchestration Flow (v2 — Diamond Edition)
+====================================================================
+Intent-based routing state machine that connects 12+ agents.
+First detects intent, then routes to the correct agent or pipeline.
+
+Routes:
+  emotional  → Emotional Agent (friendly chat, mood support)
+  email      → Email Manager Agent (Gmail operations)
+  image      → Image Analysis Agent (Gemini Vision)
+  code       → Code Assistant Agent (write/debug/review)
+  thinker    → Master Thinker Agent (deep analysis)
+  assignment → Assignment Agent (academic content)
+  work       → Work Agent (professional content)
+  life_pipeline → Full 6-agent pipeline (Memory→Research→Goals→Strategy→Plan→Report)
 """
 
 import logging
@@ -22,6 +31,10 @@ class LifeOSState(TypedDict):
     """State that flows through the entire LifeOS pipeline."""
     user_id: str
     user_input: str
+    has_image: bool
+    image_data: bytes
+    image_mime: str
+    intent: str
     user_profile: dict
     user_context: str
     goals_data: str
@@ -30,12 +43,292 @@ class LifeOSState(TypedDict):
     plan_data: str
     report_content: str
     pdf_path: str
+    agent_response: str
     status: str
     error: str
 
 
 # ═══════════════════════════════════════════
-# NODE FUNCTIONS
+# INTENT DETECTION
+# ═══════════════════════════════════════════
+
+
+def detect_intent(user_input: str, has_image: bool = False) -> str:
+    """
+    Detect the user's intent from their message.
+
+    Priority order matters — more specific intents checked first.
+
+    Args:
+        user_input: The user's message text.
+        has_image: Whether the user sent an image.
+
+    Returns:
+        Intent string: one of emotional, email, image, code, assignment,
+        work, thinker, life_pipeline.
+    """
+    if has_image:
+        return "image"
+
+    input_lower = user_input.lower().strip()
+
+    # Exact match greetings — short casual messages
+    greetings = [
+        "hi", "hello", "hey", "sup", "what's up", "how are you",
+        "good morning", "good night", "gm", "gn", "hola", "yo",
+        "wassup", "whats up", "howdy", "namaste", "vanakkam",
+        "hii", "hiii", "hiiii", "heyy", "heyyy",
+    ]
+    if input_lower in greetings or len(input_lower) < 10:
+        return "emotional"
+
+    # Emotional keywords — feelings and mood
+    emotional_keywords = [
+        "stressed", "sad", "anxious", "worried", "depressed", "lonely",
+        "happy", "excited", "angry", "tired", "bored", "miss", "love",
+        "hate", "feel", "feeling", "emotion", "cry", "crying", "hurt",
+        "scared", "afraid", "panic", "overwhelmed", "frustrated",
+        "grateful", "thankful", "proud", "confused", "lost",
+        "heartbroken", "burned out", "burnout", "vent", "rant",
+    ]
+    if any(kw in input_lower for kw in emotional_keywords):
+        return "emotional"
+
+    # Email keywords — Gmail operations
+    email_keywords = [
+        "email", "gmail", "inbox", "spam", "mail", "send mail",
+        "check mail", "delete mail", "clean inbox", "unread",
+        "send email", "check email", "delete spam", "junk",
+    ]
+    if any(kw in input_lower for kw in email_keywords):
+        return "email"
+
+    # Code keywords — programming tasks
+    code_keywords = [
+        "code", "debug", "error", "function", "program", "script",
+        "bug", "syntax", "python", "javascript", "java ", "sql",
+        "html", "css", "react", "api", "fix this", "write code",
+        "traceback", "exception", "compile", "runtime", "algorithm",
+        "data structure", "class", "object", "variable", "loop",
+        "array", "list", "dict", "json", "regex", "git", "docker",
+        "deploy", "server", "backend", "frontend", "database",
+        "mongodb", "postgresql", "flask", "django", "fastapi",
+        "node.js", "express", "typescript", "npm", "pip",
+    ]
+    if any(kw in input_lower for kw in code_keywords):
+        return "code"
+
+    # Assignment keywords — academic tasks
+    assignment_keywords = [
+        "assignment", "essay", "notes", "summarize", "exam",
+        "study", "chapter", "academic", "write about", "research paper",
+        "explain the topic", "homework", "thesis", "dissertation",
+        "question bank", "mind map", "revision", "semester",
+        "textbook", "syllabus", "marks", "grade",
+    ]
+    if any(kw in input_lower for kw in assignment_keywords):
+        return "assignment"
+
+    # Work keywords — professional tasks
+    work_keywords = [
+        "draft", "write email", "professional", "linkedin", "resume",
+        "cover letter", "meeting", "proposal", "presentation",
+        "business", "corporate", "agenda", "minutes", "task list",
+        "prioritize", "deadline", "project plan", "slide",
+    ]
+    if any(kw in input_lower for kw in work_keywords):
+        return "work"
+
+    # Thinker keywords — deep questions
+    thinker_keywords = [
+        "why", "how does", "explain", "what if", "philosophy",
+        "meaning", "theory", "analyze", "deep", "complex",
+        "understand", "think about", "perspective", "opinion",
+        "debate", "argue", "pros and cons", "trade-off",
+        "first principles", "mental model", "thought experiment",
+    ]
+    if any(kw in input_lower for kw in thinker_keywords):
+        return "thinker"
+
+    # Life pipeline keywords — goals, strategy, reports
+    life_keywords = [
+        "goal", "plan", "strategy", "life", "career", "future",
+        "report", "pdf", "generate report", "life plan",
+        "roadmap", "milestone", "vision", "track progress",
+    ]
+    if any(kw in input_lower for kw in life_keywords):
+        return "life_pipeline"
+
+    # Default to emotional/friendly chat
+    return "emotional"
+
+
+# ═══════════════════════════════════════════
+# INTENT ROUTER NODE
+# ═══════════════════════════════════════════
+
+
+def intent_router_node(state: LifeOSState) -> dict:
+    """
+    Node 0: Detect intent and route to the correct agent.
+    """
+    user_input = state["user_input"]
+    has_image = state.get("has_image", False)
+
+    intent = detect_intent(user_input, has_image)
+    logger.info(f"[Intent Router] Detected intent: {intent} for: {user_input[:50]}")
+
+    return {"intent": intent, "status": "intent_detected"}
+
+
+# ═══════════════════════════════════════════
+# SINGLE-AGENT NODES (direct response, no pipeline)
+# ═══════════════════════════════════════════
+
+
+def emotional_node(state: LifeOSState) -> dict:
+    """Run the Emotional Support Agent for friendly chat."""
+    user_id = state["user_id"]
+    user_input = state["user_input"]
+    user_context = state.get("user_context", "")
+    logger.info(f"[Emotional Node] Processing for user {user_id}")
+
+    try:
+        from agents.emotional_agent import run_emotional_agent
+        response = run_emotional_agent(user_id, user_input, user_context)
+        return {"agent_response": response, "status": "complete"}
+    except Exception as e:
+        logger.error(f"[Emotional Node] Failed: {e}")
+        return {
+            "agent_response": "Hey! 😊 I'm here for you. What's on your mind?",
+            "status": "complete",
+            "error": str(e),
+        }
+
+
+def email_node(state: LifeOSState) -> dict:
+    """Run the Email Manager Agent."""
+    user_id = state["user_id"]
+    user_input = state["user_input"]
+    user_context = state.get("user_context", "")
+    logger.info(f"[Email Node] Processing for user {user_id}")
+
+    try:
+        from agents.email_manager_agent import run_email_agent
+        response = run_email_agent(user_id, user_input, user_context)
+        return {"agent_response": response, "status": "complete"}
+    except Exception as e:
+        logger.error(f"[Email Node] Failed: {e}")
+        return {
+            "agent_response": "📧 Email features aren't configured yet. Add credentials.json to data/ folder.",
+            "status": "complete",
+            "error": str(e),
+        }
+
+
+def image_node(state: LifeOSState) -> dict:
+    """Run the Image Analysis Agent."""
+    user_id = state["user_id"]
+    user_input = state["user_input"]
+    image_data = state.get("image_data", b"")
+    image_mime = state.get("image_mime", "image/jpeg")
+    logger.info(f"[Image Node] Processing for user {user_id}")
+
+    try:
+        from agents.image_analysis_agent import run_image_agent
+        response = run_image_agent(user_id, image_data, user_input, image_mime)
+        return {"agent_response": response, "status": "complete"}
+    except Exception as e:
+        logger.error(f"[Image Node] Failed: {e}")
+        return {
+            "agent_response": "🖼️ Image analysis failed. Please try again.",
+            "status": "complete",
+            "error": str(e),
+        }
+
+
+def code_node(state: LifeOSState) -> dict:
+    """Run the Code Assistant Agent."""
+    user_id = state["user_id"]
+    user_input = state["user_input"]
+    user_context = state.get("user_context", "")
+    logger.info(f"[Code Node] Processing for user {user_id}")
+
+    try:
+        from agents.code_assistant_agent import run_code_agent
+        response = run_code_agent(user_id, user_input, user_context)
+        return {"agent_response": response, "status": "complete"}
+    except Exception as e:
+        logger.error(f"[Code Node] Failed: {e}")
+        return {
+            "agent_response": f"💻 Code assistant error: {str(e)[:200]}",
+            "status": "complete",
+            "error": str(e),
+        }
+
+
+def thinker_node(state: LifeOSState) -> dict:
+    """Run the Master Thinker Agent."""
+    user_id = state["user_id"]
+    user_input = state["user_input"]
+    user_context = state.get("user_context", "")
+    logger.info(f"[Thinker Node] Processing for user {user_id}")
+
+    try:
+        from agents.master_thinker_agent import run_thinker_agent
+        response = run_thinker_agent(user_id, user_input, user_context)
+        return {"agent_response": response, "status": "complete"}
+    except Exception as e:
+        logger.error(f"[Thinker Node] Failed: {e}")
+        return {
+            "agent_response": f"🧠 Deep thinking hit an issue: {str(e)[:200]}",
+            "status": "complete",
+            "error": str(e),
+        }
+
+
+def assignment_node(state: LifeOSState) -> dict:
+    """Run the Assignment Agent."""
+    user_id = state["user_id"]
+    user_input = state["user_input"]
+    user_context = state.get("user_context", "")
+    logger.info(f"[Assignment Node] Processing for user {user_id}")
+
+    try:
+        from agents.assignment_agent import run_assignment_agent
+        response = run_assignment_agent(user_id, user_input, user_context)
+        return {"agent_response": response, "status": "complete"}
+    except Exception as e:
+        logger.error(f"[Assignment Node] Failed: {e}")
+        return {
+            "agent_response": f"📚 Assignment assistant error: {str(e)[:200]}",
+            "status": "complete",
+            "error": str(e),
+        }
+
+
+def work_node(state: LifeOSState) -> dict:
+    """Run the Work Agent."""
+    user_id = state["user_id"]
+    user_input = state["user_input"]
+    user_context = state.get("user_context", "")
+    logger.info(f"[Work Node] Processing for user {user_id}")
+
+    try:
+        from agents.work_agent import run_work_agent
+        response = run_work_agent(user_id, user_input, user_context)
+        return {"agent_response": response, "status": "complete"}
+    except Exception as e:
+        logger.error(f"[Work Node] Failed: {e}")
+        return {
+            "agent_response": f"💼 Work assistant error: {str(e)[:200]}",
+            "status": "complete",
+            "error": str(e),
+        }
+
+
+# ═══════════════════════════════════════════
+# LIFE PIPELINE NODES (existing 6-agent pipeline)
 # ═══════════════════════════════════════════
 
 
@@ -79,6 +372,39 @@ def memory_node(state: LifeOSState) -> dict:
             "user_context": "New user - no prior context available.",
             "status": "memory_failed",
             "error": str(e),
+        }
+
+
+def quick_memory_node(state: LifeOSState) -> dict:
+    """
+    Lightweight memory load for single-agent routes.
+    Loads raw context without running the memory CrewAI agent.
+    """
+    user_id = state["user_id"]
+    user_input = state["user_input"]
+    logger.info(f"[Quick Memory] Loading context for user {user_id}")
+
+    try:
+        from agents.memory_agent import load_user_context
+
+        context = load_user_context(user_id, user_input)
+        user_context = (
+            f"{context.get('profile_summary', '')}\n"
+            f"{context.get('goals_summary', '')}\n"
+            f"{context.get('past_context', '')}"
+        )
+
+        return {
+            "user_profile": context.get("user_profile", {}),
+            "user_context": user_context,
+            "status": "memory_loaded",
+        }
+    except Exception as e:
+        logger.warning(f"[Quick Memory] Failed: {e}")
+        return {
+            "user_profile": {},
+            "user_context": "",
+            "status": "memory_skipped",
         }
 
 
@@ -250,6 +576,7 @@ def report_node(state: LifeOSState) -> dict:
 
         return {
             "report_content": report_content,
+            "agent_response": report_content,
             "status": "report_complete",
         }
 
@@ -271,6 +598,7 @@ def report_node(state: LifeOSState) -> dict:
         )
         return {
             "report_content": report_content,
+            "agent_response": report_content,
             "status": "report_partial",
         }
 
@@ -278,11 +606,21 @@ def report_node(state: LifeOSState) -> dict:
 def pdf_node(state: LifeOSState) -> dict:
     """
     Node 7: Generate PDF from the report content.
+    Only runs when explicitly requested in life_pipeline route.
     """
     report_content = state.get("report_content", "")
     user_input = state["user_input"]
     user_profile = state.get("user_profile", {})
     user_name = user_profile.get("name", "User") or "User"
+
+    # Only generate PDF if user explicitly asked for it
+    input_lower = user_input.lower()
+    wants_pdf = any(kw in input_lower for kw in ["pdf", "report", "generate", "document"])
+
+    if not wants_pdf:
+        logger.info("[PDF Node] Skipping PDF — not explicitly requested")
+        return {"pdf_path": "", "status": "complete"}
+
     logger.info(f"[PDF Node] Generating PDF for: {user_input[:50]}")
 
     try:
@@ -314,6 +652,7 @@ def save_memory_node(state: LifeOSState) -> dict:
     """
     user_id = state["user_id"]
     user_input = state["user_input"]
+    agent_response = state.get("agent_response", "")
     report_content = state.get("report_content", "")
     logger.info(f"[Save Memory Node] Saving interaction for user {user_id}")
 
@@ -321,7 +660,8 @@ def save_memory_node(state: LifeOSState) -> dict:
         from agents.memory_agent import save_interaction
 
         # Save a summary of the interaction
-        summary = report_content[:500] if report_content else "No report generated"
+        response_text = report_content or agent_response
+        summary = response_text[:500] if response_text else "No response generated"
         save_interaction(user_id, user_input, summary)
 
         # Try to extract and save topics of interest
@@ -344,15 +684,50 @@ def save_memory_node(state: LifeOSState) -> dict:
 
 
 # ═══════════════════════════════════════════
+# ROUTING LOGIC
+# ═══════════════════════════════════════════
+
+
+def route_by_intent(state: LifeOSState) -> str:
+    """
+    Conditional edge: route to the correct agent node based on detected intent.
+    """
+    intent = state.get("intent", "emotional")
+    logger.info(f"[Router] Routing to: {intent}")
+
+    route_map = {
+        "emotional": "emotional_agent",
+        "email": "email_agent",
+        "image": "image_agent",
+        "code": "code_agent",
+        "thinker": "thinker_agent",
+        "assignment": "assignment_agent",
+        "work": "work_agent",
+        "life_pipeline": "memory",
+    }
+
+    return route_map.get(intent, "emotional_agent")
+
+
+# ═══════════════════════════════════════════
 # BUILD THE LANGGRAPH WORKFLOW
 # ═══════════════════════════════════════════
 
 
 def build_lifeos_graph() -> StateGraph:
     """
-    Build and compile the LifeOS LangGraph workflow.
+    Build and compile the LifeOS LangGraph workflow with intent routing.
 
-    Flow: START → memory → research → goals → strategy → planning → report → pdf → save_memory → END
+    Flow:
+      START → intent_router → (conditional routing)
+        → emotional_agent → save_memory → END
+        → email_agent → save_memory → END
+        → image_agent → save_memory → END
+        → code_agent → save_memory → END
+        → thinker_agent → save_memory → END
+        → assignment_agent → save_memory → END
+        → work_agent → save_memory → END
+        → memory → research → goals → strategy → planning → report → pdf → save_memory → END
 
     Returns:
         Compiled LangGraph workflow.
@@ -360,7 +735,20 @@ def build_lifeos_graph() -> StateGraph:
     # Create the state graph
     workflow = StateGraph(LifeOSState)
 
-    # Add all nodes
+    # Add intent router node
+    workflow.add_node("intent_router", intent_router_node)
+
+    # Add single-agent nodes (quick routes)
+    workflow.add_node("quick_memory", quick_memory_node)
+    workflow.add_node("emotional_agent", emotional_node)
+    workflow.add_node("email_agent", email_node)
+    workflow.add_node("image_agent", image_node)
+    workflow.add_node("code_agent", code_node)
+    workflow.add_node("thinker_agent", thinker_node)
+    workflow.add_node("assignment_agent", assignment_node)
+    workflow.add_node("work_agent", work_node)
+
+    # Add life pipeline nodes (full 6-agent pipeline)
     workflow.add_node("memory", memory_node)
     workflow.add_node("research", research_node)
     workflow.add_node("goals", goals_node)
@@ -368,10 +756,49 @@ def build_lifeos_graph() -> StateGraph:
     workflow.add_node("planning", planning_node)
     workflow.add_node("report", report_node)
     workflow.add_node("pdf", pdf_node)
+
+    # Add save memory node (shared)
     workflow.add_node("save_memory", save_memory_node)
 
-    # Define the flow (linear pipeline)
-    workflow.set_entry_point("memory")
+    # Set entry point
+    workflow.set_entry_point("intent_router")
+
+    # Conditional routing based on intent
+    workflow.add_conditional_edges(
+        "intent_router",
+        route_by_intent,
+        {
+            "emotional_agent": "quick_memory",
+            "email_agent": "email_agent",
+            "image_agent": "image_agent",
+            "code_agent": "quick_memory",
+            "thinker_agent": "quick_memory",
+            "assignment_agent": "quick_memory",
+            "work_agent": "quick_memory",
+            "memory": "memory",
+        },
+    )
+
+    # Quick memory → agent routing (needs a second conditional)
+    # For simplicity, we route quick_memory to the correct agent via intent check
+    workflow.add_conditional_edges(
+        "quick_memory",
+        lambda state: state.get("intent", "emotional"),
+        {
+            "emotional": "emotional_agent",
+            "code": "code_agent",
+            "thinker": "thinker_agent",
+            "assignment": "assignment_agent",
+            "work": "work_agent",
+        },
+    )
+
+    # Single-agent nodes → save_memory → END
+    for agent_node in ["emotional_agent", "email_agent", "image_agent",
+                        "code_agent", "thinker_agent", "assignment_agent", "work_agent"]:
+        workflow.add_edge(agent_node, "save_memory")
+
+    # Life pipeline: memory → research → goals → strategy → planning → report → pdf → save_memory
     workflow.add_edge("memory", "research")
     workflow.add_edge("research", "goals")
     workflow.add_edge("goals", "strategy")
@@ -379,11 +806,13 @@ def build_lifeos_graph() -> StateGraph:
     workflow.add_edge("planning", "report")
     workflow.add_edge("report", "pdf")
     workflow.add_edge("pdf", "save_memory")
+
+    # save_memory → END
     workflow.add_edge("save_memory", END)
 
     # Compile the graph
     compiled = workflow.compile()
-    logger.info("LifeOS LangGraph workflow compiled successfully")
+    logger.info("LifeOS LangGraph workflow compiled successfully (v2 — Diamond Edition)")
     return compiled
 
 
@@ -395,16 +824,21 @@ def build_lifeos_graph() -> StateGraph:
 async def run_lifeos_pipeline(
     user_id: str,
     user_input: str,
+    has_image: bool = False,
+    image_data: bytes = b"",
+    image_mime: str = "image/jpeg",
     status_callback=None,
 ) -> LifeOSState:
     """
-    Run the complete LifeOS pipeline for a user query.
+    Run the LifeOS pipeline for a user query with intent-based routing.
 
     Args:
         user_id: Unique user identifier.
         user_input: The user's message/query.
+        has_image: Whether the message includes an image.
+        image_data: Raw image bytes (if has_image is True).
+        image_mime: MIME type of the image.
         status_callback: Optional async callback for status updates.
-            Called with (status_emoji, status_message) at each stage.
 
     Returns:
         Final LifeOSState with all results.
@@ -418,6 +852,10 @@ async def run_lifeos_pipeline(
     initial_state: LifeOSState = {
         "user_id": str(user_id),
         "user_input": user_input,
+        "has_image": has_image,
+        "image_data": image_data,
+        "image_mime": image_mime,
+        "intent": "",
         "user_profile": {},
         "user_context": "",
         "goals_data": "",
@@ -426,12 +864,22 @@ async def run_lifeos_pipeline(
         "plan_data": "",
         "report_content": "",
         "pdf_path": "",
+        "agent_response": "",
         "status": "starting",
         "error": "",
     }
 
     # Status messages for each stage
     status_messages = {
+        "intent_router": ("🧭", "Understanding your message..."),
+        "quick_memory": ("🧠", "Loading your context..."),
+        "emotional_agent": ("🤗", "Thinking of the best response..."),
+        "email_agent": ("📧", "Managing your emails..."),
+        "image_agent": ("🖼️", "Analyzing your image..."),
+        "code_agent": ("💻", "Working on your code..."),
+        "thinker_agent": ("🧠", "Thinking deeply..."),
+        "assignment_agent": ("📚", "Working on your assignment..."),
+        "work_agent": ("💼", "Creating professional content..."),
         "memory": ("🧠", "Loading your profile and memories..."),
         "research": ("🔍", "Researching your topic..."),
         "goals": ("🎯", "Analyzing your goals..."),
